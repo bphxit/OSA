@@ -1,29 +1,104 @@
-import sqlite3
 from pathlib import Path
-import json,re,pandas as pd
+import csv, json
+import pandas as pd
 from app.core.db import connect
-ALIASES={'date':['date','session date','therapy date','start date'],'usage_hours':['usage','usage hours','therapy hours','hours'],'ahi':['ahi'],'oa':['oa','obstructive apnea'],'ca':['ca','central apnea'],'hi':['hi','hypopnea'],'rera':['rera'],'spo2_mean':['spo2 mean','avg spo2','mean spo2'],'spo2_min':['spo2 min','minimum spo2','min spo2'],'snoring_index':['snoring index'],'snoring_duration_min':['snoring duration','snore duration'],'snoring_pct':['snoring %','snoring percent'],'csr_pct':['csr','cheyne stokes','csr %'],'periodic_breathing_pct':['periodic breathing','pb %','pb'],'leak_median':['median leak','leak median'],'leak_95':['95% leak','95th percentile leak','95 leak'],'leak_above_threshold_min':['time above leak threshold'],'mask_off_events':['mask off'],'avg_pressure':['average pressure','avg pressure'],'median_pressure':['median pressure'],'hr_mean':['mean hr','average hr','hr mean'],'hrv_mean':['hrv'],'tst_hours':['tst','total sleep time'],'sleep_efficiency':['sleep efficiency'],'awakenings':['awakenings','arousals'],'rem_hours':['rem'],'deep_sleep_hours':['deep sleep','n3'],'sleep_latency_min':['sleep latency']}
-def norm(s): return re.sub(r'[^a-z0-9]+',' ',str(s).lower()).strip()
-def map_columns(columns):
- n={norm(c):c for c in columns}; out={}
- for f,a in ALIASES.items():
-  for x in a:
-   if norm(x) in n: out[f]=n[norm(x)]; break
- return out
-def num(v):
- try:return float(str(v).replace('%','').replace(',','').strip())
- except:return None
-def import_csv(path:Path):
- df=pd.read_csv(path); m=map_columns(df.columns)
- if 'date' not in m: raise ValueError(f'No date column identified in {path.name}')
- source='oscar' if 'oscar' in path.name.lower() else ('prismats' if 'prisma' in path.name.lower() else 'csv')
- db=connect(); ins=skip=issues=0
- for _,row in df.iterrows():
-  d=pd.to_datetime(row[m['date']],errors='coerce')
-  if pd.isna(d): issues+=1; continue
-  ds=d.strftime('%Y-%m-%d'); v={k:num(row[c]) for k,c in m.items() if k!='date'}
-  try:
-   db.execute('INSERT INTO sleep_sessions(session_date,source,source_file,usage_hours,ahi,oa,ca,hi,rera,spo2_mean,spo2_min,snoring_index,snoring_duration_min,snoring_pct,csr_pct,periodic_breathing_pct,leak_median,leak_95,leak_above_threshold_min,mask_off_events,avg_pressure,median_pressure,hr_mean,hrv_mean,tst_hours,sleep_efficiency,awakenings,rem_hours,deep_sleep_hours,sleep_latency_min,raw_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(ds,source,path.name,v.get('usage_hours'),v.get('ahi'),v.get('oa'),v.get('ca'),v.get('hi'),v.get('rera'),v.get('spo2_mean'),v.get('spo2_min'),v.get('snoring_index'),v.get('snoring_duration_min'),v.get('snoring_pct'),v.get('csr_pct'),v.get('periodic_breathing_pct'),v.get('leak_median'),v.get('leak_95'),v.get('leak_above_threshold_min'),v.get('mask_off_events'),v.get('avg_pressure'),v.get('median_pressure'),v.get('hr_mean'),v.get('hrv_mean'),v.get('tst_hours'),v.get('sleep_efficiency'),v.get('awakenings'),v.get('rem_hours'),v.get('deep_sleep_hours'),v.get('sleep_latency_min'),json.dumps({str(k):str(x) for k,x in row.to_dict().items()}))); ins+=1
-  except sqlite3.IntegrityError: skip+=1
-  except Exception: issues+=1
- db.commit(); db.close(); return {'file':path.name,'inserted':ins,'skipped':skip,'issues':issues,'columns':m}
+
+
+def _clean_number(v):
+    if v is None: return None
+    s=str(v).strip()
+    if not s or s in {'--','-','nan','NaN'}: return None
+    s=s.replace('%','').replace(',','').strip()
+    try: return float(s)
+    except (ValueError, TypeError): return None
+
+
+def _read_csv(path: Path):
+    first = path.read_text(encoding='utf-8-sig', errors='replace').splitlines()[0]
+    sep = ';' if first.count(';') > first.count(',') else ','
+    return pd.read_csv(path, sep=sep, encoding='utf-8-sig'), sep
+
+
+def _json_row(row):
+    return json.dumps({str(k): (None if pd.isna(v) else str(v)) for k,v in row.items()}, ensure_ascii=False)
+
+
+def _duration_to_hours(v):
+    if v is None or pd.isna(v): return None
+    s=str(v).strip()
+    if ':' in s:
+        try: return pd.to_timedelta(s).total_seconds()/3600
+        except Exception: return None
+    return _clean_number(v)
+
+
+def import_oscar_sessions(path: Path):
+    df,_ = _read_csv(path)
+    required={'Date','Session','Start','End','Total Time','AHI','CA Count','OA Count','H Count'}
+    missing=required-set(df.columns)
+    if missing: raise ValueError(f'OSCAR Sessions missing columns: {sorted(missing)}')
+    inserted=skipped=0; db=connect()
+    for _,r in df.iterrows():
+        d=pd.to_datetime(r['Date'], errors='coerce')
+        if pd.isna(d): continue
+        sid=str(r['Session'])
+        duration=pd.to_timedelta(r['Total Time'], errors='coerce').total_seconds() if pd.notna(r['Total Time']) else None
+        vals=(d.strftime('%Y-%m-%d'),sid,str(r['Start']),str(r['End']),'oscar_sessions',path.name,duration,duration/3600 if duration else None,
+              _clean_number(r['AHI']),_clean_number(r['OA Count']),_clean_number(r['CA Count']),_clean_number(r['H Count']),_clean_number(r.get('UA Count')),
+              _clean_number(r.get('RE Count')),_clean_number(r.get('VS Count')),_clean_number(r.get('Median Pressure')),_clean_number(r.get('Median IPAP')),
+              _clean_number(r.get('Median EPAP')),_clean_number(r.get('95% Pressure')),_clean_number(r.get('95% IPAP')),_clean_number(r.get('95% EPAP')),
+              _clean_number(r.get('Max Pressure')),_clean_number(r.get('Max IPAP')),_clean_number(r.get('Max EPAP')),_json_row(r))
+        cur=db.execute('''INSERT OR IGNORE INTO sleep_sessions
+          (therapy_date,session_id,start_time,end_time,source,source_file,duration_seconds,usage_hours,ahi,oa,ca,hi,ua,rera,snoring_index,median_pressure,median_ipap,median_epap,p95_pressure,p95_ipap,p95_epap,max_pressure,max_ipap,max_epap,raw_json)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', vals)
+        inserted += 1 if cur.rowcount else 0; skipped += 0 if cur.rowcount else 1
+    db.commit(); db.close()
+    return {'file':path.name,'type':'oscar_sessions','inserted':inserted,'skipped':skipped}
+
+
+def import_oscar_details(path: Path):
+    db=connect(); db.execute('PRAGMA synchronous=NORMAL'); db.execute('PRAGMA journal_mode=WAL')
+    inserted=skipped=0; batch=[]
+    with path.open('r',encoding='utf-8-sig',newline='') as fh:
+        reader=csv.DictReader(fh); required={'DateTime','Session','Event','Data/Duration'}
+        missing=required-set(reader.fieldnames or [])
+        if missing: raise ValueError(f'OSCAR Details missing columns: {sorted(missing)}')
+        for r in reader:
+            dt=pd.to_datetime(r.get('DateTime'), errors='coerce')
+            if pd.isna(dt): continue
+            batch.append((dt.strftime('%Y-%m-%d'),str(r.get('Session','')),dt.isoformat(),str(r.get('Event','')),_clean_number(r.get('Data/Duration')),path.name))
+            if len(batch)>=10000:
+                cur=db.executemany('INSERT OR IGNORE INTO pap_events(therapy_date,session_id,event_time,event_type,value,source_file) VALUES(?,?,?,?,?,?)',batch)
+                n=max(cur.rowcount,0); inserted+=n; skipped+=len(batch)-n; db.commit(); batch.clear()
+    if batch:
+        cur=db.executemany('INSERT OR IGNORE INTO pap_events(therapy_date,session_id,event_time,event_type,value,source_file) VALUES(?,?,?,?,?,?)',batch)
+        n=max(cur.rowcount,0); inserted+=n; skipped+=len(batch)-n
+    db.commit(); db.close(); return {'file':path.name,'type':'oscar_details','inserted':inserted,'skipped':skipped}
+
+
+def import_prismats(path: Path):
+    df,_ = _read_csv(path)
+    if 'Filter_From' not in df.columns or 'Filter_To' not in df.columns: raise ValueError('PrismaTS TherapyStatistics requires Filter_From and Filter_To')
+    df=df[df.get('Id','').astype(str).str.lower().eq('value')].copy()
+    inserted=skipped=0; db=connect()
+    for _,r in df.iterrows():
+        d=pd.to_datetime(str(r['Filter_From']).strip(), dayfirst=True, errors='coerce')
+        if pd.isna(d): continue
+        def n(name): return _clean_number(r.get(name))
+        row=(d.strftime('%Y-%m-%d'),'prismats',path.name,_duration_to_hours(r.get('AvgUsage')),n('AHI'),n('oAHI'),n('cAHI'),n('HI'),
+             n('Percentile_Leakage_P50'),n('Percentile_Leakage_P95'),n('Percentile_DurationLeakageHigh_P95'),n('PressureEpapMin'),n('PressureEpapMax'),
+             n('PressureIpapMin'),n('PressureIpapMax'),n('Percentile_Ipap_P95'),n('Min_SpO2'),n('Percentile_SpO2_P50'),n('Percentile_SpO2_P95'),
+             n('Percentile_HeartRate_P50'),n('Percentile_BreathingFrequency_P50'),n('Percentile_Vt_P50'),n('Percentile_Amv_P50'),_json_row(r))
+        cur=db.execute('''INSERT OR IGNORE INTO daily_metrics
+            (therapy_date,source,source_file,usage_hours,ahi,oa,ca,hi,leak_p50,leak_p95,duration_leak_high,epap_min,epap_max,ipap_min,ipap_max,ipap_p95,spo2_min,spo2_p50,spo2_p95,hr_p50,breathing_frequency_p50,tidal_volume_p50,minute_ventilation_p50,raw_json)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',row)
+        inserted+=1 if cur.rowcount else 0; skipped+=0 if cur.rowcount else 1
+    db.commit(); db.close(); return {'file':path.name,'type':'prismats_therapy_statistics','inserted':inserted,'skipped':skipped}
+
+
+def import_csv(path: Path):
+    name=path.name.lower()
+    if 'oscar' in name and 'details' in name: return import_oscar_details(path)
+    if 'oscar' in name and 'sessions' in name: return import_oscar_sessions(path)
+    if 'prism' in name and 'therapystatistics' in name: return import_prismats(path)
+    raise ValueError(f'Unsupported OSA export: {path.name}')
