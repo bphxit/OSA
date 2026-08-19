@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "osa": {
+      "command": "C:\\OSA\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "app.mcp_server"],
+      "cwd": "C:\\OSA"
+    }
+  }
+}

@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+*.db
+*.sqlite3
+.env
+data/incoming/*
+data/processed/*
+data/archive/*
+data/medical/*
+data/reports/*
+!data/incoming/.gitkeep
+!data/processed/.gitkeep
+!data/archive/.gitkeep
+!data/medical/.gitkeep
+!data/reports/.gitkeep
