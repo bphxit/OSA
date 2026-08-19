@@ -38,12 +38,17 @@ def import_oscar_sessions(path: Path):
     missing=required-set(df.columns)
     if missing: raise ValueError(f'OSCAR Sessions missing columns: {sorted(missing)}')
     inserted=skipped=0; db=connect()
+    existing_dates=set(x[0] for x in db.execute("SELECT DISTINCT therapy_date FROM sleep_sessions WHERE source='oscar_sessions'").fetchall())
+    skipped_dates=set()
     for _,r in df.iterrows():
         d=pd.to_datetime(r['Date'], errors='coerce')
         if pd.isna(d): continue
+        therapy_date=d.strftime('%Y-%m-%d')
+        if therapy_date in existing_dates or therapy_date in skipped_dates:
+            skipped += 1; skipped_dates.add(therapy_date); continue
         sid=str(r['Session'])
         duration=pd.to_timedelta(r['Total Time'], errors='coerce').total_seconds() if pd.notna(r['Total Time']) else None
-        vals=(d.strftime('%Y-%m-%d'),sid,str(r['Start']),str(r['End']),'oscar_sessions',path.name,duration,duration/3600 if duration else None,
+        vals=(therapy_date,sid,str(r['Start']),str(r['End']),'oscar_sessions',path.name,duration,duration/3600 if duration else None,
               _clean_number(r['AHI']),_clean_number(r['OA Count']),_clean_number(r['CA Count']),_clean_number(r['H Count']),_clean_number(r.get('UA Count')),
               _clean_number(r.get('RE Count')),_clean_number(r.get('VS Count')),_clean_number(r.get('Median Pressure')),_clean_number(r.get('Median IPAP')),
               _clean_number(r.get('Median EPAP')),_clean_number(r.get('95% Pressure')),_clean_number(r.get('95% IPAP')),_clean_number(r.get('95% EPAP')),
@@ -52,13 +57,14 @@ def import_oscar_sessions(path: Path):
           (therapy_date,session_id,start_time,end_time,source,source_file,duration_seconds,usage_hours,ahi,oa,ca,hi,ua,rera,snoring_index,median_pressure,median_ipap,median_epap,p95_pressure,p95_ipap,p95_epap,max_pressure,max_ipap,max_epap,raw_json)
           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', vals)
         inserted += 1 if cur.rowcount else 0; skipped += 0 if cur.rowcount else 1
-    db.commit(); db.close()
-    return {'file':path.name,'type':'oscar_sessions','inserted':inserted,'skipped':skipped}
+    db.commit(); db.close(); return {'file':path.name,'type':'oscar_sessions','inserted':inserted,'skipped':skipped}
 
 
 def import_oscar_details(path: Path):
     db=connect(); db.execute('PRAGMA synchronous=NORMAL'); db.execute('PRAGMA journal_mode=WAL')
     inserted=skipped=0; batch=[]
+    existing_dates=set(x[0] for x in db.execute('SELECT DISTINCT therapy_date FROM pap_events').fetchall())
+    skipped_dates=set()
     with path.open('r',encoding='utf-8-sig',newline='') as fh:
         reader=csv.DictReader(fh); required={'DateTime','Session','Event','Data/Duration'}
         missing=required-set(reader.fieldnames or [])
@@ -66,7 +72,10 @@ def import_oscar_details(path: Path):
         for r in reader:
             dt=pd.to_datetime(r.get('DateTime'), errors='coerce')
             if pd.isna(dt): continue
-            batch.append((dt.strftime('%Y-%m-%d'),str(r.get('Session','')),dt.isoformat(),str(r.get('Event','')),_clean_number(r.get('Data/Duration')),path.name))
+            therapy_date=dt.strftime('%Y-%m-%d')
+            if therapy_date in existing_dates or therapy_date in skipped_dates:
+                skipped_dates.add(therapy_date); continue
+            batch.append((therapy_date,str(r.get('Session','')),dt.isoformat(),str(r.get('Event','')),_clean_number(r.get('Data/Duration')),path.name))
             if len(batch)>=10000:
                 cur=db.executemany('INSERT OR IGNORE INTO pap_events(therapy_date,session_id,event_time,event_type,value,source_file) VALUES(?,?,?,?,?,?)',batch)
                 n=max(cur.rowcount,0); inserted+=n; skipped+=len(batch)-n; db.commit(); batch.clear()
@@ -81,11 +90,14 @@ def import_prismats(path: Path):
     if 'Filter_From' not in df.columns or 'Filter_To' not in df.columns: raise ValueError('PrismaTS TherapyStatistics requires Filter_From and Filter_To')
     df=df[df.get('Id','').astype(str).str.lower().eq('value')].copy()
     inserted=skipped=0; db=connect()
+    existing_dates=set(x[0] for x in db.execute("SELECT DISTINCT therapy_date FROM daily_metrics WHERE source='prismats'").fetchall())
     for _,r in df.iterrows():
         d=pd.to_datetime(str(r['Filter_From']).strip(), dayfirst=True, errors='coerce')
         if pd.isna(d): continue
+        therapy_date=d.strftime('%Y-%m-%d')
+        if therapy_date in existing_dates: skipped+=1; continue
         def n(name): return _clean_number(r.get(name))
-        row=(d.strftime('%Y-%m-%d'),'prismats',path.name,_duration_to_hours(r.get('AvgUsage')),n('AHI'),n('oAHI'),n('cAHI'),n('HI'),
+        row=(therapy_date,'prismats',path.name,_duration_to_hours(r.get('AvgUsage')),n('AHI'),n('oAHI'),n('cAHI'),n('HI'),
              n('Percentile_Leakage_P50'),n('Percentile_Leakage_P95'),n('Percentile_DurationLeakageHigh_P95'),n('PressureEpapMin'),n('PressureEpapMax'),
              n('PressureIpapMin'),n('PressureIpapMax'),n('Percentile_Ipap_P95'),n('Min_SpO2'),n('Percentile_SpO2_P50'),n('Percentile_SpO2_P95'),
              n('Percentile_HeartRate_P50'),n('Percentile_BreathingFrequency_P50'),n('Percentile_Vt_P50'),n('Percentile_Amv_P50'),_json_row(r))
