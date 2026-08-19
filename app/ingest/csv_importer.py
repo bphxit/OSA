@@ -1,14 +1,14 @@
 from pathlib import Path
-import csv, json
+import csv
+import json
 import pandas as pd
 from app.core.db import connect
 
 
 def _clean_number(v):
-    if v is None: return None
-    s=str(v).strip()
+    if v is None or (isinstance(v, float) and pd.isna(v)): return None
+    s=str(v).strip().replace('%','').replace(',','')
     if not s or s in {'--','-','nan','NaN'}: return None
-    s=s.replace('%','').replace(',','').strip()
     try: return float(s)
     except (ValueError, TypeError): return None
 
@@ -38,14 +38,13 @@ def import_oscar_sessions(path: Path):
     missing=required-set(df.columns)
     if missing: raise ValueError(f'OSCAR Sessions missing columns: {sorted(missing)}')
     inserted=skipped=0; db=connect()
-    existing_dates=set(x[0] for x in db.execute("SELECT DISTINCT therapy_date FROM sleep_sessions WHERE source='oscar_sessions'").fetchall())
-    skipped_dates=set()
+    existing_dates={x[0] for x in db.execute("SELECT DISTINCT therapy_date FROM sleep_sessions WHERE source='oscar_sessions'").fetchall()}
     for _,r in df.iterrows():
         d=pd.to_datetime(r['Date'], errors='coerce')
         if pd.isna(d): continue
         therapy_date=d.strftime('%Y-%m-%d')
-        if therapy_date in existing_dates or therapy_date in skipped_dates:
-            skipped += 1; skipped_dates.add(therapy_date); continue
+        if therapy_date in existing_dates:
+            skipped += 1; continue
         sid=str(r['Session'])
         duration=pd.to_timedelta(r['Total Time'], errors='coerce').total_seconds() if pd.notna(r['Total Time']) else None
         vals=(therapy_date,sid,str(r['Start']),str(r['End']),'oscar_sessions',path.name,duration,duration/3600 if duration else None,
@@ -56,14 +55,14 @@ def import_oscar_sessions(path: Path):
         cur=db.execute('''INSERT OR IGNORE INTO sleep_sessions
           (therapy_date,session_id,start_time,end_time,source,source_file,duration_seconds,usage_hours,ahi,oa,ca,hi,ua,rera,snoring_index,median_pressure,median_ipap,median_epap,p95_pressure,p95_ipap,p95_epap,max_pressure,max_ipap,max_epap,raw_json)
           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', vals)
-        inserted += 1 if cur.rowcount else 0; skipped += 0 if cur.rowcount else 1
+        inserted += 1 if cur.rowcount else 0
+        skipped += 0 if cur.rowcount else 1
     db.commit(); db.close(); return {'file':path.name,'type':'oscar_sessions','inserted':inserted,'skipped':skipped}
 
 
 def import_oscar_details(path: Path):
-    db=connect(); db.execute('PRAGMA synchronous=NORMAL'); db.execute('PRAGMA journal_mode=WAL')
-    inserted=skipped=0; batch=[]
-    existing_dates=set(x[0] for x in db.execute('SELECT DISTINCT therapy_date FROM pap_events').fetchall())
+    db=connect(); inserted=skipped=0; batch=[]
+    existing_dates={x[0] for x in db.execute('SELECT DISTINCT therapy_date FROM pap_events').fetchall()}
     skipped_dates=set()
     with path.open('r',encoding='utf-8-sig',newline='') as fh:
         reader=csv.DictReader(fh); required={'DateTime','Session','Event','Data/Duration'}
@@ -88,14 +87,15 @@ def import_oscar_details(path: Path):
 def import_prismats(path: Path):
     df,_ = _read_csv(path)
     if 'Filter_From' not in df.columns or 'Filter_To' not in df.columns: raise ValueError('PrismaTS TherapyStatistics requires Filter_From and Filter_To')
-    df=df[df.get('Id','').astype(str).str.lower().eq('value')].copy()
+    value_rows=df[df['Id'].astype(str).str.lower().eq('value')].copy() if 'Id' in df.columns else df.iloc[:1]
     inserted=skipped=0; db=connect()
-    existing_dates=set(x[0] for x in db.execute("SELECT DISTINCT therapy_date FROM daily_metrics WHERE source='prismats'").fetchall())
-    for _,r in df.iterrows():
+    existing_dates={x[0] for x in db.execute("SELECT DISTINCT therapy_date FROM daily_metrics WHERE source='prismats'").fetchall()}
+    for _,r in value_rows.iterrows():
         d=pd.to_datetime(str(r['Filter_From']).strip(), dayfirst=True, errors='coerce')
         if pd.isna(d): continue
         therapy_date=d.strftime('%Y-%m-%d')
-        if therapy_date in existing_dates: skipped+=1; continue
+        if therapy_date in existing_dates:
+            skipped+=1; continue
         def n(name): return _clean_number(r.get(name))
         row=(therapy_date,'prismats',path.name,_duration_to_hours(r.get('AvgUsage')),n('AHI'),n('oAHI'),n('cAHI'),n('HI'),
              n('Percentile_Leakage_P50'),n('Percentile_Leakage_P95'),n('Percentile_DurationLeakageHigh_P95'),n('PressureEpapMin'),n('PressureEpapMax'),
